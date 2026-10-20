@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Red: NanoHTTPD + WebSocketServer -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Necesario para leer el NOMBRE real de la red Wi-Fi (SSID) desde
+         Android 8.1+ — sin esto, WifiManager devuelve "<unknown ssid>" en
+         vez del nombre real. Se pide en tiempo de ejecución, no basta con
+         declararlo acá. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- Bluetooth: PrinterManager reusado del proyecto cliente -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- ★ NUEVO — PrinterConfigActivityServidor la pide junto con CONNECT al
+         mostrar la lista de dispositivos emparejados (mismo patrón que el
+         cliente). No se usa para descubrir equipos nuevos (no hay
+         startDiscovery acá), pero sin declararla en el manifest la petición
+         de runtime queda denegada de entrada en Android 12+. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+
+    <!-- Foreground Service: para que Android 8 no mate el servidor al apagar
+         pantalla. ★ CAMBIADO de dataSync a specialUse: desde Android 14
+         (API 34, nuestro targetSdk) los Foreground Service de tipo dataSync
+         tienen un límite DURO de 6 horas de ejecución acumulada cada 24hs
+         mientras la app no está en primer plano — al llegar a ese límite el
+         sistema apaga el servicio solo, aunque el WakeLock/WifiLock sigan
+         vivos. Eso era la causa real de "el servidor se desactiva solo
+         después de un rato de inactividad": no era un problema de energía,
+         era este límite específico de Android 14 aplicado al tipo de
+         servicio equivocado. specialUse es el tipo pensado justamente para
+         casos que no encajan en las categorías estándar (no es música, no
+         es ubicación, no es sync de contactos) y NO tiene ese límite de 6hs. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Para que la pantalla no se apague sola mientras el servidor está activo
+         (una tablet dedicada a esto no debería bloquearse) -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- ★ NUEVO — watchdog (ver WatchdogReceiver): revivir el servidor si
+         EMUI lo mata pasando por alto START_STICKY, y si la tablet se
+         reinicia (corte de luz, etc.) sin que alguien tenga que abrir la
+         app a mano. SCHEDULE_EXACT_ALARM es necesario en Android 12+ para
+         que setExactAndAllowWhileIdle funcione sin pedir permiso especial
+         en runtime (en Android 8, este dispositivo, ni siquiera hace falta,
+         pero se declara para que el mismo APK sirva si el día de mañana
+         esto corre en un equipo más nuevo). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- ★ NUEVO — para poder pedirle al usuario que excluya esta app de la
+         optimización de batería. Sin esto, en Android 8+ (sobre todo Xiaomi/
+         Samsung/Huawei con sus propios "administradores de batería") el
+         sistema puede limitar la CPU y la red del proceso cuando la pantalla
+         está apagada, AUNQUE sea un Foreground Service — el Foreground
+         Service evita que lo MATEN, pero no evita que lo THROTTLEEN. Se pide
+         en tiempo de ejecución desde EstadoServidorActivity, este permiso
+         solo habilita mostrar el diálogo del sistema. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Bufalos Server"
+        android:theme="@style/Theme.AppCompat.DayNight.NoActionBar"
+        android:usesCleartextTraffic="true">
+
+        <!-- Pantalla de estado: arranca/para el servicio, muestra IP:puerto + QR -->
+        <!-- ★ NUEVO — android:configChanges: evita que Android destruya y
+             recree esta Activity al girar la tablet. Sin esto, cada rotación
+             disparaba onCreate() de nuevo, y aunque ahora onCreate() ya
+             consulta el estado real del servicio (ver EstadoServidorActivity),
+             seguía recreando toda la UI (QR, listeners, permisos) sin
+             necesidad. Con configChanges declarado, Android llama a
+             onConfigurationChanged() en vez de recrear todo — como esta
+             pantalla no toca nada layout-dependiente distinto entre
+             orientaciones, no hace falta ni sobreescribir ese método. -->
+        <activity
+            android:name=".EstadoServidorActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ★ NUEVO — configurar/emparejar la impresora Bluetooth del servidor,
+             elegir modo Impresora/Registro, imprimir ticket de prueba. Se abre
+             desde el botón "🖨️ Configurar impresora" en EstadoServidorActivity. -->
+        <activity
+            android:name=".print.PrinterConfigActivityServidor"
+            android:exported="false" />
+
+        <!-- El corazón del proyecto: NanoHTTPD + WebSocketServer + Room, todo
+             en un único proceso para no repartir los 2GB de RAM entre varios.
+             specialUse en vez de dataSync (ver comentario del permiso más
+             arriba) — Android 14 exige esta <property> declarando el motivo
+             cuando se usa specialUse, si no la llamada a startForeground()
+             tira MissingSpecialUseFgsSubtypeException en tiempo de ejecución. -->
+        <service
+            android:name=".servicio.ServidorService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Servidor HTTP/WebSocket local del punto de venta: debe seguir atendiendo pedidos de las tablets del local en todo momento, sin límite de tiempo en segundo plano." />
+        </service>
+
+        <!-- ★ NUEVO — ver WatchdogReceiver: revive el servicio si EMUI lo
+             mató saltándose START_STICKY, y lo levanta de nuevo si la
+             tablet se reinicia. exported=true porque el sistema es quien
+             manda el broadcast de BOOT_COMPLETED. -->
+        <receiver
+            android:name=".servicio.WatchdogReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

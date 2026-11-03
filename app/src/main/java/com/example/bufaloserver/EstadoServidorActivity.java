@@ -28,6 +28,7 @@ import android.widget.Toast;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import com.example.bufaloserver.servicio.ServidorService;
@@ -66,20 +67,37 @@ public class EstadoServidorActivity extends AppCompatActivity {
     /** ★ NUEVO — resumen de una línea del estado de la limpieza de datos. */
     private TextView tvLimpieza;
     private boolean servidorEncendido = false;
+    /** 0=apagado, 1=encendido, 2=iniciando. Evita reescribir textos y crear
+     *  un drawable nuevo cada 2 s cuando el estado no cambió. */
+    private int estadoUiActual = -1;
+
+    /** Último "ip:puerto" mostrado, para no regenerar el QR en cada refresco. */
+    private String ultimaIpPuerto = null;
+    /** Contador para refrescar la info de red (IP/SSID) cada ~10 s. */
+    private int ticksRed = 0;
 
     /** Refresca "N tablets conectadas" cada 2s mientras la pantalla está visible. */
     private final android.os.Handler handlerClientes = new android.os.Handler(android.os.Looper.getMainLooper());
     private final Runnable refrescarClientesRunnable = new Runnable() {
         @Override
         public void run() {
+            // ★ FIX — el estado del servidor y la IP también se refrescan
+            // solos: antes el QR quedaba congelado con la IP del arranque y,
+            // si DHCP la cambiaba (o el WiFi se reconectaba), los celulares
+            // escaneaban una dirección que ya no existía.
+            sincronizarUiConServicioReal();
             actualizarClientesConectados();
+            if (++ticksRed >= 5) {
+                ticksRed = 0;
+                actualizarInfoRed();
+            }
             handlerClientes.postDelayed(this, 2000);
         }
     };
 
-    private final ActivityResultLauncher<String> pedirPermisoUbicacion =
-            registerForActivityResult(new androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
-                    concedido -> actualizarInfoRed()); // con o sin permiso, refresca lo que pueda mostrar
+    private final ActivityResultLauncher<String[]> pedirPermisoUbicacion =
+            registerForActivityResult(new androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions(),
+                    resultado -> actualizarInfoRed()); // con o sin permiso, refresca lo que pueda mostrar
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -288,9 +306,33 @@ public class EstadoServidorActivity extends AppCompatActivity {
         sincronizarUiConServicioReal();
         actualizarVisibilidadBotonBateria();
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+        // ★ FIX ANDROID 13+ — en API 33+ el SSID se lee con
+        // NEARBY_WIFI_DEVICES (ya no hace falta ubicación) y las
+        // notificaciones necesitan permiso explícito. Se piden las dos en
+        // UNA sola solicitud: si se lanzaran por separado junto con la de
+        // ubicación, Android puede descartar los diálogos superpuestos y
+        // quedar sin pedir la notificación. En API < 33 se pide ubicación.
+        if (Build.VERSION.SDK_INT >= 33) {
+            java.util.ArrayList<String> faltantes = new java.util.ArrayList<>();
+            if (ContextCompat.checkSelfPermission(this, "android.permission.NEARBY_WIFI_DEVICES")
+                    != PackageManager.PERMISSION_GRANTED) {
+                faltantes.add("android.permission.NEARBY_WIFI_DEVICES");
+            }
+            if (ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS")
+                    != PackageManager.PERMISSION_GRANTED) {
+                faltantes.add("android.permission.POST_NOTIFICATIONS");
+            }
+            if (!faltantes.isEmpty()) {
+                ActivityCompat.requestPermissions(this,
+                        faltantes.toArray(new String[0]), 201);
+            }
+        } else if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+                != PackageManager.PERMISSION_GRANTED
+                || ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION)
                 != PackageManager.PERMISSION_GRANTED) {
-            pedirPermisoUbicacion.launch(Manifest.permission.ACCESS_FINE_LOCATION);
+            pedirPermisoUbicacion.launch(new String[]{
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION});
         }
 
         verificarPrimerAdmin();
@@ -539,10 +581,16 @@ public class EstadoServidorActivity extends AppCompatActivity {
      * fuera de esta pantalla (ej. START_STICKY reiniciándolo solo).
      */
     private void sincronizarUiConServicioReal() {
-        if (ServidorService.getInstancia() != null) {
+        ServidorService servicio = ServidorService.getInstancia();
+        if (servicio == null) {
+            actualizarUiApagado();
+        } else if (servicio.estaSaludable()) {
             actualizarUiEncendido();
         } else {
-            actualizarUiApagado();
+            // ★ FIX — servicio vivo pero sin puertos: antes se mostraba
+            // "🟢 activo" igual, y el usuario no tenía forma de saber que en
+            // realidad nadie podía conectarse. Ahora se ve el estado real.
+            actualizarUiIniciando();
         }
     }
 
@@ -579,6 +627,10 @@ public class EstadoServidorActivity extends AppCompatActivity {
                 .setTitle("Desactivar servidor")
                 .setMessage("¿Seguro que quiere desactivar el servidor?")
                 .setPositiveButton("Desactivar", (dialog, which) -> {
+                    // ★ Se cancela primero el watchdog: si no, a los pocos
+                    // minutos volvería a levantar el servidor que el usuario
+                    // acaba de apagar a propósito.
+                    com.example.bufaloserver.servicio.WatchdogReceiver.cancelarProximoTick(this);
                     Intent intent = new Intent(this, ServidorService.class);
                     stopService(intent);
                     actualizarUiApagado();
@@ -589,13 +641,26 @@ public class EstadoServidorActivity extends AppCompatActivity {
 
     private void actualizarUiEncendido() {
         servidorEncendido = true;
+        if (estadoUiActual == 1) return;
+        estadoUiActual = 1;
         tvEstado.setText("🟢 Servidor activo");
         btnToggle.setText("Detener servidor");
         aplicarColorBoton(0xFFD32F2F);
     }
 
+    private void actualizarUiIniciando() {
+        servidorEncendido = true;
+        if (estadoUiActual == 2) return;
+        estadoUiActual = 2;
+        tvEstado.setText("🟠 Servidor iniciando/reparando…");
+        btnToggle.setText("Detener servidor");
+        aplicarColorBoton(0xFFF57C00);
+    }
+
     private void actualizarUiApagado() {
         servidorEncendido = false;
+        if (estadoUiActual == 0) return;
+        estadoUiActual = 0;
         tvEstado.setText("🔴 Servidor detenido");
         btnToggle.setText("Iniciar servidor");
         aplicarColorBoton(0xFF2E7D32);
@@ -637,7 +702,12 @@ public class EstadoServidorActivity extends AppCompatActivity {
 
         tvRed.setText(ssid != null ? "📶 Red: " + ssid : "📶 Red: no se pudo detectar (¿wifi conectado?)");
         tvIpPuerto.setText(ipPuerto);
-        generarQr(ipPuerto);
+        // El QR solo se redibuja si la dirección cambió: así el refresco
+        // periódico no repinta/parpadea la imagen cada 10 s sin motivo.
+        if (!ipPuerto.equals(ultimaIpPuerto)) {
+            ultimaIpPuerto = ipPuerto;
+            generarQr(ipPuerto);
+        }
     }
 
     private void generarQr(String contenido) {
@@ -676,20 +746,55 @@ public class EstadoServidorActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * ★ FIX IP — antes se usaba WifiManager.getConnectionInfo().getIpAddress(),
+     * deprecado, que devuelve 0 en equipos/permisos donde no tiene visibilidad
+     * de la conexión (el QR terminaba mostrando "192.168.x.x"). Ahora se lee
+     * la dirección IPv4 real de las interfaces de red (wlan/eth/ap), que no
+     * depende de ese permiso, y se deja WifiManager solo como último recurso.
+     */
     private String obtenerIpLocal() {
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> ifaces =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            String candidata = null;
+            while (ifaces != null && ifaces.hasMoreElements()) {
+                java.net.NetworkInterface ni = ifaces.nextElement();
+                if (ni == null || !ni.isUp() || ni.isLoopback()) continue;
+                String nombre = ni.getName();
+                boolean esWifi = nombre != null && (nombre.startsWith("wlan") || nombre.startsWith("eth")
+                        || nombre.startsWith("ap") || nombre.startsWith("swlan"));
+                for (java.net.InetAddress addr : java.util.Collections.list(ni.getInetAddresses())) {
+                    if (addr == null || addr.isLoopbackAddress()
+                            || !(addr instanceof java.net.Inet4Address)) continue;
+                    String ip = addr.getHostAddress();
+                    if (ip == null || ip.startsWith("169.254.")) continue; // link-local, sin DHCP
+                    if (esWifi) return ip;
+                    if (candidata == null) candidata = ip;
+                }
+            }
+            if (candidata != null) return candidata;
+        } catch (Exception ignored) {
+        }
+
         try {
             WifiManager wifiManager = (WifiManager) getApplicationContext()
                     .getSystemService(WIFI_SERVICE);
             int ip = wifiManager.getConnectionInfo().getIpAddress();
-            if (ip == 0) return "192.168.x.x"; // sin wifi conectado
-            return Formatter.formatIpAddress(ip);
-        } catch (Exception e) {
-            return "192.168.x.x";
+            if (ip != 0) return Formatter.formatIpAddress(ip);
+        } catch (Exception ignored) {
         }
+        return "192.168.x.x"; // sin wifi conectado
     }
 
     private int dp(int valor) {
         return Math.round(valor * getResources().getDisplayMetrics().density);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 201) actualizarInfoRed(); // el SSID puede estar disponible ahora
     }
 
     @Override

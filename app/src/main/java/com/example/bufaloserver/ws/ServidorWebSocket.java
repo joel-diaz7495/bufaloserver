@@ -36,6 +36,12 @@ public class ServidorWebSocket extends WebSocketServer {
 
     private static final String TAG = "ServidorWebSocket";
 
+    /** true desde onStart() hasta que la librería reporta un fallo a nivel de
+     *  servidor (onError con conn==null) o hasta que el servicio lo detiene.
+     *  ServidorService lo usa para detectar que el puerto nunca llegó a
+     *  abrirse y reintentar en vez de quedarse con un servidor muerto. */
+    private volatile boolean activo = false;
+
     public ServidorWebSocket(InetSocketAddress address, Context context) {
         super(address);
         // ★ FIX — mismo criterio que WsClient.InnerWs del lado cliente: sin
@@ -44,6 +50,14 @@ public class ServidorWebSocket extends WebSocketServer {
         // broadcast() durante mucho más tiempo del que debería, y mientras
         // tanto ese celular no recibe ningún aviso aunque parezca conectado.
         setConnectionLostTimeout(25);
+        // ★ FIX LATENCIA — sin TCP_NODELAY los avisos chicos (unos pocos
+        // bytes de JSON) esperan el algoritmo de Nagle antes de salir, lo que
+        // agrega decenas de ms a cada evento en una LAN. No cambia el ancho
+        // de banda, solo evita esa espera artificial.
+        setTcpNoDelay(true);
+        // ★ FIX REINICIO — permite volver a levantar el puerto aunque queden
+        // sockets en TIME_WAIT tras un reinicio del servicio.
+        setReuseAddr(true);
     }
 
     @Override
@@ -84,6 +98,13 @@ public class ServidorWebSocket extends WebSocketServer {
             Log.w(TAG, "Handshake rechazado (sin sesión válida): " + conn.getRemoteSocketAddress());
             throw new InvalidDataException(CloseFrame.POLICY_VALIDATION, "Token de sesión inválido o ausente");
         }
+        // ★ FIX SESIÓN INVALIDADA — se guarda el token en la conexión para
+        // poder cerrarla en el acto si ese token se invalida (logout,
+        // revocación de dispositivo, cambio de PIN o re-login). Antes la
+        // conexión quedaba abierta y el equipo seguía recibiendo avisos que
+        // después no podía usar (HTTP ya le respondía 401), dando errores
+        // confusos hasta que se reconectaba solo.
+        conn.setAttachment(token);
         return builder;
     }
 
@@ -100,12 +121,34 @@ public class ServidorWebSocket extends WebSocketServer {
 
     @Override
     public void onError(WebSocket conn, Exception ex) {
-        Log.e(TAG, "Error en WebSocket", ex);
+        // conn == null significa fallo a nivel del servidor (típicamente el
+        // bind del puerto falló porque estaba ocupado). Ese caso sí deja el
+        // servidor inservible; los errores de una conexión puntual (conn !=
+        // null) no deben marcarlo como caído.
+        if (conn == null) {
+            activo = false;
+            Log.e(TAG, "Fallo del WebSocketServer: se reintentará", ex);
+        } else {
+            Log.w(TAG, "Error en una conexión WebSocket", ex);
+        }
     }
 
     @Override
     public void onStart() {
+        activo = true;
         Log.i(TAG, "WebSocketServer listo");
+    }
+
+    /** ServidorService consulta esto para saber si el puerto realmente quedó
+     *  escuchando; start() es asíncrono, así que no alcanza con que el objeto
+     *  exista. */
+    public boolean estaActivo() {
+        return activo;
+    }
+
+    /** Marca el servidor como apagado antes de un stop() explícito. */
+    public void marcarDetenido() {
+        activo = false;
     }
 
     // ── API pública para el resto del servidor ──────────────────────────────
@@ -124,6 +167,31 @@ public class ServidorWebSocket extends WebSocketServer {
      */
     public int getCantidadConectados() {
         return getConnections().size();
+    }
+
+    /**
+     * ★ NUEVO — cierra ya las conexiones cuyo token dejó de ser válido. Se
+     * llama desde ServidorHttp al invalidar sesiones (logout, revocación,
+     * cambio de PIN o re-login del mismo dispositivo). Así el cliente se
+     * entera en el acto (el socket se cierra) en vez de quedar con un canal
+     * abierto recibiendo avisos mientras sus pedidos HTTP ya dan 401.
+     */
+    public void cerrarConexionesConTokens(java.util.Collection<String> tokens) {
+        if (tokens == null || tokens.isEmpty()) return;
+        java.util.List<WebSocket> aCerrar = new java.util.ArrayList<>();
+        for (WebSocket conn : getConnections()) {
+            Object adjunto = conn.getAttachment();
+            if (adjunto instanceof String && tokens.contains((String) adjunto)) {
+                aCerrar.add(conn);
+            }
+        }
+        for (WebSocket conn : aCerrar) {
+            try {
+                conn.close(CloseFrame.POLICY_VALIDATION, "Sesión invalidada");
+            } catch (Exception e) {
+                Log.w(TAG, "No se pudo cerrar el WebSocket invalidado", e);
+            }
+        }
     }
 
     public void avisarProductoActualizado(long productoId) {

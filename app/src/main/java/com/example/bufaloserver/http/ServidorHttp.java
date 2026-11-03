@@ -1,6 +1,7 @@
 package com.example.bufaloserver.http;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
@@ -58,7 +59,7 @@ public class ServidorHttp extends NanoHTTPD {
     private static final String TAG = "ServidorHttp";
 
     private final Context context;
-    private ServidorWebSocket ws;
+    private volatile ServidorWebSocket ws;
 
     /**
      * Lock para asignar numero_orden de forma atómica.
@@ -105,22 +106,111 @@ public class ServidorHttp extends NanoHTTPD {
     //      tira abajo cualquier sesión activa de ese dispositivo acá mismo —
     //      efecto inmediato, sin esperar a que expire nada.
     //
-    // Vive en memoria (no en la tabla) a propósito: si el servidor se
-    // reinicia, todos vuelven a loguearse — comportamiento aceptable para un
-    // servidor POS local, y más simple que persistir sesiones.
+    // ★ FIX RECONEXIÓN — antes vivía solo en memoria y, cuando EMUI mataba y
+    // volvía a crear el proceso (muy común con la pantalla apagada), todos
+    // los tokens se perdían: el HTTP empezaba a responder 401 y el WebSocket
+    // rechazaba el handshake con 1008, así que desde los celulares se veía
+    // como "el servidor dejó de responder" hasta que cada uno volviera a
+    // loguearse a mano. Ahora se respaldan en SharedPreferences y se recargan
+    // al construir este objeto, SIN vencimiento por tiempo: siguen valiendo
+    // hasta logout, revocación del dispositivo o cambio/desactivación del
+    // usuario (esos tres casos sí las eliminan y se persisten).
     private static final class Sesion {
         final long usuarioId;
         final long dispositivoId;
         final String rol;
-        Sesion(long usuarioId, long dispositivoId, String rol) {
+        final long creadoEn;
+        Sesion(long usuarioId, long dispositivoId, String rol, long creadoEn) {
             this.usuarioId = usuarioId;
             this.dispositivoId = dispositivoId;
             this.rol = rol;
+            this.creadoEn = creadoEn;
         }
     }
 
+    private static final String PREFS_SESIONES = "bufaloserver_sesiones";
+    private static final String KEY_SESIONES = "mapa";
+
     private static final Map<String, Sesion> SESIONES = new ConcurrentHashMap<>();
+    /** Serializa mutaciones + volcado a disco, para que dos logins/logouts
+     *  simultáneos no se pisen el archivo (el mapa se actualizaría en RAM,
+     *  pero al reiniciar se perdería el token del que escribió primero). */
+    private static final Object LOCK_SESIONES = new Object();
     private static final SecureRandom RANDOM_SEGURO = new SecureRandom();
+
+    /** Carga las sesiones guardadas por una instancia anterior del proceso.
+     *  Se llama desde el constructor (por eso sobreviven a que EMUI mate y
+     *  recree el servicio). No aplica vencimiento por tiempo, pero deja UN
+     *  solo token por dispositivo: si el archivo tuviera varios (por logins
+     *  viejos), se conserva el más reciente y los demás se descartan. */
+    private void cargarSesionesPersistidas() {
+        synchronized (LOCK_SESIONES) {
+        try {
+            SharedPreferences prefs = context.getSharedPreferences(PREFS_SESIONES, Context.MODE_PRIVATE);
+            String raw = prefs.getString(KEY_SESIONES, null);
+            if (raw == null || raw.isEmpty()) return;
+            JSONArray arr = new JSONArray(raw);
+
+            // dispositivoId → objeto más reciente de ese dispositivo
+            java.util.HashMap<Long, JSONObject> porDispositivo = new java.util.HashMap<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                String token = o.optString("token", null);
+                if (token == null || token.isEmpty()) continue;
+                long dispositivoId = o.optLong("dispositivoId", 0);
+                if (dispositivoId <= 0) continue; // entrada corrupta/vieja
+                JSONObject previo = porDispositivo.get(dispositivoId);
+                if (previo == null || o.optLong("creadoEn", 0) > previo.optLong("creadoEn", 0)) {
+                    porDispositivo.put(dispositivoId, o);
+                }
+            }
+
+            int cargadas = 0;
+            for (JSONObject o : porDispositivo.values()) {
+                String token = o.optString("token", null);
+                if (token == null || token.isEmpty()) continue;
+                SESIONES.put(token, new Sesion(
+                        o.optLong("usuarioId", 0),
+                        o.optLong("dispositivoId", 0),
+                        o.optString("rol", ""),
+                        o.optLong("creadoEn", System.currentTimeMillis())));
+                cargadas++;
+            }
+            if (cargadas > 0) Log.i(TAG, "Sesiones restauradas tras reinicio: " + cargadas);
+        } catch (Exception e) {
+            Log.w(TAG, "No se pudieron restaurar las sesiones guardadas", e);
+        }
+        }
+    }
+
+    /** Vuelca el mapa de sesiones a disco. Se llama en login y en cada
+     *  invalidación (logout/revocación); son eventos poco frecuentes, así que
+     *  el costo de escribir el archivo es despreciable. */
+    private void persistirSesiones() {
+        synchronized (LOCK_SESIONES) {
+            try {
+                JSONArray arr = new JSONArray();
+                for (Map.Entry<String, Sesion> entrada : SESIONES.entrySet()) {
+                    JSONObject o = new JSONObject();
+                    o.put("token", entrada.getKey());
+                    o.put("usuarioId", entrada.getValue().usuarioId);
+                    o.put("dispositivoId", entrada.getValue().dispositivoId);
+                    o.put("rol", entrada.getValue().rol);
+                    o.put("creadoEn", entrada.getValue().creadoEn);
+                    arr.put(o);
+                }
+                // commit() (no apply()): el objetivo de esta persistencia es
+                // sobrevivir a que Android mate el proceso, así que conviene
+                // que el archivo esté escrito antes de responder. Es un JSON
+                // chico y solo pasa en login/logout/revocación.
+                context.getSharedPreferences(PREFS_SESIONES, Context.MODE_PRIVATE)
+                        .edit().putString(KEY_SESIONES, arr.toString()).commit();
+            } catch (Exception e) {
+                Log.w(TAG, "No se pudieron guardar las sesiones", e);
+            }
+        }
+    }
 
     /** Token largo y aleatorio — se usa tanto para deviceToken como para el
      *  código dentro del QR de emparejamiento. 32 bytes al azar en base64. */
@@ -139,11 +229,33 @@ public class ServidorHttp extends NanoHTTPD {
         return SESIONES.get(auth.substring("Bearer ".length()).trim());
     }
 
-    /** Elimina cualquier sesión activa asociada a un dispositivo — se llama
-     *  al revocar, para que el corte de acceso sea inmediato y no dependa de
-     *  que el token "expire" solo. */
+    /** Quita del mapa las sesiones que cumplan el filtro y devuelve sus
+     *  tokens, para poder cerrar además los WebSocket asociados. */
+    private java.util.List<String> quitarSesionesQueCumplen(
+            java.util.function.Predicate<Sesion> filtro) {
+        java.util.List<String> tokens = new java.util.ArrayList<>();
+        for (Map.Entry<String, Sesion> entrada : SESIONES.entrySet()) {
+            if (filtro.test(entrada.getValue())) tokens.add(entrada.getKey());
+        }
+        for (String token : tokens) SESIONES.remove(token);
+        return tokens;
+    }
+
+    /** Cierra los WebSocket de tokens que acaban de quedar inválidos. */
+    private void cerrarWsInvalidados(java.util.List<String> tokens) {
+        ServidorWebSocket wsActual = ws;
+        if (wsActual != null && tokens != null && !tokens.isEmpty()) {
+            wsActual.cerrarConexionesConTokens(tokens);
+        }
+    }
+
     private void invalidarSesionesDeDispositivo(long dispositivoId) {
-        SESIONES.values().removeIf(s -> s.dispositivoId == dispositivoId);
+        java.util.List<String> tokens;
+        synchronized (LOCK_SESIONES) {
+            tokens = quitarSesionesQueCumplen(s -> s.dispositivoId == dispositivoId);
+            persistirSesiones();
+        }
+        cerrarWsInvalidados(tokens);
     }
 
     /**
@@ -176,7 +288,12 @@ public class ServidorHttp extends NanoHTTPD {
      * actualizarUsuario apenas el usuario queda eliminado o inactivo.
      */
     private void invalidarSesionesDeUsuario(long usuarioId) {
-        SESIONES.values().removeIf(s -> s.usuarioId == usuarioId);
+        java.util.List<String> tokens;
+        synchronized (LOCK_SESIONES) {
+            tokens = quitarSesionesQueCumplen(s -> s.usuarioId == usuarioId);
+            persistirSesiones();
+        }
+        cerrarWsInvalidados(tokens);
     }
 
     /**
@@ -242,6 +359,9 @@ public class ServidorHttp extends NanoHTTPD {
         sonidoReconexionListenerActivo = com.example.bufaloserver.servicio.SonidosServidor::impresoraReconectada;
         pm.addDisconnectListener(sonidoDesconexionListenerActivo);
         pm.addReconnectListener(sonidoReconexionListenerActivo);
+
+        // ★ FIX RECONEXIÓN — recupera los tokens de la ejecución anterior.
+        cargarSesionesPersistidas();
     }
 
     /**
@@ -309,6 +429,19 @@ public class ServidorHttp extends NanoHTTPD {
         Method metodo = session.getMethod();
 
         try {
+            // ★ NUEVO — sonda liviana y SIN autenticación para que el cliente
+            // pueda distinguir "el servidor está vivo pero mi token venció"
+            // (401 en el resto de rutas) de "el servidor no responde" (fallo
+            // de red). No expone ningún dato sensible.
+            if (uri.equals("/ping") && metodo == Method.GET) {
+                JSONObject p = new JSONObject();
+                try {
+                    p.put("ok", true);
+                    p.put("puerto", getListeningPort());
+                    p.put("hora", System.currentTimeMillis());
+                } catch (JSONException ignored) {}
+                return jsonOk(p.toString());
+            }
             if (uri.equals("/login") && metodo == Method.POST) {
                 return manejarLogin(session);
             }
@@ -629,7 +762,18 @@ public class ServidorHttp extends NanoHTTPD {
         }
 
         String sessionToken = generarTokenSeguro();
-        SESIONES.put(sessionToken, new Sesion(usuario.id, dispositivo.id, usuario.rol));
+        // ★ Un solo token vigente por dispositivo: si el celular vuelve a
+        // loguearse, el token anterior deja de servir al instante. Evita que
+        // se acumulen sesiones viejas sin vencimiento y que un token de un
+        // login anterior siga vivo después de un re-login.
+        java.util.List<String> tokensViejos;
+        synchronized (LOCK_SESIONES) {
+            tokensViejos = quitarSesionesQueCumplen(s -> s.dispositivoId == dispositivo.id);
+            SESIONES.put(sessionToken, new Sesion(usuario.id, dispositivo.id, usuario.rol,
+                    System.currentTimeMillis()));
+            persistirSesiones();
+        }
+        cerrarWsInvalidados(tokensViejos);
         // ★ MEJORA VELOCIDAD — la escritura de "último uso" ya no bloquea la
         // respuesta del login (era un write a disco síncrono, lento en flash viejo).
         final long idDispositivo = dispositivo.id;
@@ -3788,7 +3932,12 @@ public class ServidorHttp extends NanoHTTPD {
         // revalida después — si a un Administrador lo bajan a Mesero, sin
         // esto seguiría teniendo privilegios de admin en su sesión actual
         // hasta que cerrara sesión por su cuenta.
-        if (!existente.activo || !existente.rol.equals(rolAnterior)) invalidarSesionesDeUsuario(id);
+        // ★ FIX TOKENS PERMANENTES — también se corta al cambiar el PIN: si
+        // no, un token guardado en un celular viejo/perdido seguiría válido
+        // para siempre aunque el PIN se haya cambiado justamente por eso.
+        if (!existente.activo || cambiaPin || !existente.rol.equals(rolAnterior)) {
+            invalidarSesionesDeUsuario(id);
+        }
         if (ws != null) ws.avisarUsuarioActualizado(id);
         return jsonOk("{}");
     }

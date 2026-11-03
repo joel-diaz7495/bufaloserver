@@ -56,10 +56,28 @@ public class ServidorService extends Service {
     public static final int PUERTO_HTTP = 8080;
     public static final int PUERTO_WS = 8081;
 
-    private ServidorHttp servidorHttp;
+    // volatile: los lee el hilo de salud, el Watchdog y la UI, mientras se
+    // asignan/limpian en onStartCommand y onDestroy.
+    private volatile ServidorHttp servidorHttp;
     /** ★ NUEVO — revisa cada hora si toca la limpieza automática de datos (ver LimpiezaDatos). */
     private java.util.concurrent.ScheduledExecutorService limpiezaScheduler;
-    private ServidorWebSocket servidorWebSocket;
+    private volatile ServidorWebSocket servidorWebSocket;
+
+    /** ★ NUEVO — auto-reparación en caliente: cada 30 s comprueba que HTTP y
+     *  WS sigan realmente escuchando y vuelve a levantarlos si alguno murió.
+     *  Antes, si el bind fallaba una sola vez (puerto ocupado, socket en
+     *  TIME_WAIT), el servicio quedaba "vivo" pero sin atender a nadie para
+     *  siempre. */
+    private java.util.concurrent.ScheduledExecutorService saludScheduler;
+
+    /** Momento del último intento de arrancar el WebSocket. start() es
+     *  asíncrono, así que se le da un margen antes de considerarlo caído y
+     *  recrearlo. */
+    private volatile long ultimoIntentoWs = 0L;
+
+    /** Evita que el hilo de salud vuelva a levantar los servidores después
+     *  de onDestroy (carrera entre "reparar" y "detener"). */
+    private volatile boolean destruido = false;
 
     /**
      * PARTIAL_WAKE_LOCK: mantiene la CPU despierta aunque se apague la
@@ -118,6 +136,14 @@ public class ServidorService extends Service {
         instancia = this;
         crearCanalNotificacion();
         DiagnosticoLog.registrar(this, "🟢 Servicio creado (onCreate)");
+        // ★ NUEVO — SonidosServidor necesita contexto para revisar/subir el
+        // volumen de la salida activa (jack o parlante) antes de cada beep.
+        SonidosServidor.init(getApplicationContext());
+        // Precalienta el hash del PIN una sola vez por proceso (no en cada
+        // reparación del health check), para que el primer login no pague el
+        // arranque en frío de PBKDF2.
+        new Thread(com.example.bufaloserver.seguridad.PinHasher::precalentar,
+                "pin-precalentar").start();
         // ★ NUEVO — arranca la cadena de auto-chequeo cada 10 min (ver
         // WatchdogReceiver). Si EMUI mata este proceso más adelante, esa
         // alarma ya programada sigue viva en el sistema (no depende de que
@@ -132,6 +158,19 @@ public class ServidorService extends Service {
                 () -> com.example.bufaloserver.servicio.LimpiezaDatos
                         .ejecutarAutomaticaSiCorresponde(getApplicationContext()),
                 5, 60, java.util.concurrent.TimeUnit.MINUTES);
+
+        // ★ NUEVO — chequeo de salud propio, independiente del Watchdog (que
+        // solo revive el proceso si Android lo mata). Este cubre el caso más
+        // silencioso: el servicio sigue vivo pero uno de los dos puertos no
+        // llegó a abrirse o se cayó. Primer chequeo a los 15 s (deja terminar
+        // el arranque) y luego cada 30 s.
+        saludScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "servidor-salud");
+            t.setDaemon(true);
+            return t;
+        });
+        saludScheduler.scheduleWithFixedDelay(this::verificarYReparar, 15, 30,
+                java.util.concurrent.TimeUnit.SECONDS);
     }
 
     @Override
@@ -189,9 +228,19 @@ public class ServidorService extends Service {
         WifiManager wm = (WifiManager) getApplicationContext()
                 .getSystemService(Context.WIFI_SERVICE);
         if (wm == null) return;
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "bufaloserver:wifi_activo");
+        // WIFI_MODE_FULL_HIGH_PERF quedó deprecado en API 29; en equipos
+        // nuevos el modo LOW_LATENCY mantiene el radio activo sin el ahorro
+        // de energía que corta las conexiones cuando la pantalla se apaga.
+        int modo = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+        wifiLock = wm.createWifiLock(modo, "bufaloserver:wifi_activo");
         wifiLock.setReferenceCounted(false);
-        wifiLock.acquire();
+        try {
+            wifiLock.acquire();
+        } catch (SecurityException e) {
+            Log.w(TAG, "No se pudo adquirir el WifiLock", e);
+        }
     }
 
     /**
@@ -211,24 +260,51 @@ public class ServidorService extends Service {
         }
     }
 
-    private void iniciarServidores() {
-        // ★ MEJORA VELOCIDAD — precalienta el hash del PIN en segundo plano
-        // para que el primer login no pague el arranque en frío.
-        new Thread(com.example.bufaloserver.seguridad.PinHasher::precalentar, "pin-precalentar").start();
+    /**
+     * Arranca (o repara) los dos servidores. Es idempotente y synchronized
+     * porque lo llaman tanto onStartCommand como el chequeo de salud.
+     *
+     * ★ FIX CAÍDAS SILENCIOSAS — antes se asignaba el campo ANTES de
+     * start(): si start() lanzaba IOException (puerto ocupado, TIME_WAIT),
+     * el campo quedaba no-null apuntando a un servidor que nunca escuchó, y
+     * el reintento siguiente lo veía "ya iniciado" y no hacía nada. Ahora el
+     * campo solo se asigna si el arranque salió bien, y el health check
+     * vuelve a intentarlo solo.
+     */
+    private synchronized void iniciarServidores() {
+        if (destruido) return; // el servicio ya se está apagando
 
+        if (servidorHttp != null && !servidorHttp.isAlive()) {
+            try { servidorHttp.stop(); } catch (Throwable ignored) {}
+            servidorHttp = null;
+        }
         if (servidorHttp == null) {
             try {
-                servidorHttp = new ServidorHttp(this, PUERTO_HTTP);
-                servidorHttp.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false);
+                ServidorHttp nuevo = new ServidorHttp(this, PUERTO_HTTP);
+                nuevo.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false);
+                servidorHttp = nuevo;
                 Log.i(TAG, "NanoHTTPD escuchando en puerto " + PUERTO_HTTP);
             } catch (IOException e) {
-                Log.e(TAG, "No se pudo levantar el servidor HTTP", e);
+                servidorHttp = null;
+                Log.e(TAG, "No se pudo levantar el servidor HTTP; se reintentará", e);
             }
         }
 
+        // start() del WebSocket es asíncrono: si falló el bind, recién se
+        // entera en onError(null, ...). Se le da un margen de 5 s antes de
+        // darlo por muerto para no recrearlo mientras todavía está abriendo.
+        boolean wsOk = servidorWebSocket != null && servidorWebSocket.estaActivo();
+        if (!wsOk && servidorWebSocket != null
+                && System.currentTimeMillis() - ultimoIntentoWs > 5000) {
+            servidorWebSocket.marcarDetenido();
+            try { servidorWebSocket.stop(); } catch (Throwable ignored) {}
+            servidorWebSocket = null;
+        }
         if (servidorWebSocket == null) {
-            servidorWebSocket = new ServidorWebSocket(new InetSocketAddress(PUERTO_WS), this);
-            servidorWebSocket.start();
+            ServidorWebSocket nuevo = new ServidorWebSocket(new InetSocketAddress(PUERTO_WS), this);
+            ultimoIntentoWs = System.currentTimeMillis();
+            servidorWebSocket = nuevo;
+            nuevo.start();
             Log.i(TAG, "WebSocketServer escuchando en puerto " + PUERTO_WS);
         }
 
@@ -236,6 +312,38 @@ public class ServidorService extends Service {
         // WS cuando cambia un pedido/usuario/producto (ver rutas en serve()).
         if (servidorHttp != null && servidorWebSocket != null) {
             servidorHttp.setWebSocket(servidorWebSocket);
+        }
+    }
+
+    /**
+     * ★ NUEVO — true solo si HTTP y WebSocket están realmente escuchando.
+     * Que el servicio exista no alcanza: es justo el estado engañoso que
+     * dejaba la app mostrando "encendido" mientras nadie podía conectarse.
+     */
+    public boolean estaSaludable() {
+        ServidorHttp http = servidorHttp;
+        ServidorWebSocket ws = servidorWebSocket;
+        return http != null && http.isAlive() && ws != null && ws.estaActivo();
+    }
+
+    /** Fuerza un intento de arranque/reparación (lo usa WatchdogReceiver
+     *  cuando detecta el servicio vivo pero sin puertos operativos). */
+    public void reintentarServidores() {
+        iniciarServidores();
+    }
+
+    private void verificarYReparar() {
+        try {
+            boolean httpOk = servidorHttp != null && servidorHttp.isAlive();
+            boolean wsOk = servidorWebSocket != null && servidorWebSocket.estaActivo();
+            if (!httpOk || !wsOk) {
+                DiagnosticoLog.registrar(this,
+                        "⚠️ Salud del servidor: HTTP=" + (httpOk ? "ok" : "caído")
+                                + ", WS=" + (wsOk ? "ok" : "caído") + " — reparando");
+                iniciarServidores();
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Error en chequeo de salud del servidor", t);
         }
     }
 
@@ -272,19 +380,45 @@ public class ServidorService extends Service {
                 .build();
     }
 
+    /**
+     * ★ NUEVO — cuando el usuario quita la app de "recientes", algunas ROMs
+     * (EMUI incluida) matan el proceso aunque sea un Foreground Service. La
+     * alarma del watchdog no depende de este proceso, así que se reprograma
+     * acá para revivirlo lo antes posible.
+     */
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        WatchdogReceiver.programarProximoTick(this);
+        DiagnosticoLog.registrar(this, "🧹 App quitada de recientes; watchdog reprogramado");
+        super.onTaskRemoved(rootIntent);
+    }
+
     @Override
     public void onDestroy() {
         super.onDestroy();
+        destruido = true;
         if (instancia == this) instancia = null;
         if (limpiezaScheduler != null) limpiezaScheduler.shutdownNow();
+        if (saludScheduler != null) saludScheduler.shutdownNow();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
-        if (servidorHttp != null) servidorHttp.stop();
-        if (servidorWebSocket != null) {
-            try {
-                servidorWebSocket.stop();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        // synchronized(this): espera a que termine un iniciarServidores() en
+        // curso (hilo de salud) antes de apagar, para no dejar un puerto
+        // levantado después de destruido el servicio.
+        synchronized (this) {
+            if (servidorHttp != null) {
+                servidorHttp.stop();
+                servidorHttp = null;
+            }
+            if (servidorWebSocket != null) {
+                servidorWebSocket.marcarDetenido();
+                try {
+                    servidorWebSocket.stop();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (Throwable ignored) {
+                }
+                servidorWebSocket = null;
             }
         }
         DiagnosticoLog.registrar(this, "🔴 Servicio destruido (onDestroy)");

@@ -45,23 +45,22 @@ public final class PinHasher {
 
     private static final String ALGORITMO = "PBKDF2WithHmacSHA256";
 
-    // 120.000 iteraciones: un valor típico recomendado para PBKDF2-SHA256 en
-    // 2024-2026. En el hardware más flojo que corre esta app (la Huawei
-    // AGS-L03, Android 8), un login tarda un extra de algunas decenas de
-    // milisegundos por esto — imperceptible para el usuario (el login ya
-    // implica ida y vuelta de red), y sigue siendo rápido porque esto corre
-    // UNA vez por login, no en un loop.
+    // Costo del PBKDF2. En el hardware más flojo que corre esta app (la
+    // Huawei AGS-L03, Android 8) cada iteración extra se nota, y el login
+    // corre UNA vez por intento (no en un loop), así que se prioriza que
+    // responda rápido en la LAN por sobre un costo teórico que un PIN de 4
+    // dígitos no puede aprovechar de todos modos.
     // ★ FIX LOGIN LENTO — antes 120_000 para todo. En la Huawei AGS-L03
     // (Android 8, PBKDF2 en Java puro, sin JIT caliente) una sola
     // verificación podía tardar segundos y pasar los 5 s de timeout del
-    // cliente. Los hashes NUEVOS usan ITERACIONES (10_000); los viejos
+    // cliente. Los hashes NUEVOS usan ITERACIONES (1_000); los viejos
     // guardados sin prefijo se siguen verificando con ITERACIONES_LEGADO
     // y se re-hashean solos en el primer login correcto (ver
     // ServidorHttp.manejarLogin). Formato nuevo: "<iteraciones>$<base64>".
     // Con un PIN de 4 dígitos el espacio es 10.000 valores: la diferencia
-    // de seguridad real entre 10k y 120k iteraciones es despreciable; el
-    // login ya exige además un dispositivo emparejado.
-    private static final int ITERACIONES = 10_000;
+    // de seguridad real entre 1k y 120k iteraciones es despreciable en una
+    // LAN de confianza; el login ya exige además un dispositivo emparejado.
+    private static final int ITERACIONES = 1_000;
     private static final int ITERACIONES_LEGADO = 120_000;
     private static final int LONGITUD_CLAVE_BITS = 256;
     private static final int LONGITUD_SALT_BYTES = 16;

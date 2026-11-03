@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Red: NanoHTTPD + WebSocketServer -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -11,6 +12,17 @@
          vez del nombre real. Se pide en tiempo de ejecución, no basta con
          declararlo acá. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Android 12+ exige pedir FINE y COARSE juntos; el usuario puede
+         conceder solo COARSE y con eso alcanza para el SSID. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- ★ NUEVO — desde Android 13 (API 33) el SSID no se puede leer sin este
+         permiso, aunque ya esté concedido ACCESS_FINE_LOCATION. Se declara
+         con neverForLocation porque solo se usa para mostrar el nombre de la
+         red en pantalla, no para ubicar al usuario. -->
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
 
     <!-- Bluetooth: PrinterManager reusado del proyecto cliente -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />

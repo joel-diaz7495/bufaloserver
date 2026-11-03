@@ -38,10 +38,12 @@ public class WatchdogReceiver extends BroadcastReceiver {
     private static final String ACCION_TICK = "com.example.bufaloserver.WATCHDOG_TICK";
     private static final int REQUEST_CODE = 1001;
 
-    /** Cada cuánto se revisa. 10 min: suficientemente seguido para no dejar
-     *  el servidor caído mucho rato, sin ser tan agresivo como para gastar
-     *  batería de más despertando el equipo todo el tiempo. */
-    private static final long INTERVALO_MS = 10 * 60 * 1000L;
+    /** Cada cuánto se revisa. 3 min: la tablet del local suele estar
+     *  enchufada (sin Doze), y este tick es la red de seguridad para cuando
+     *  EMUI mata el proceso. En Doze profundo el sistema igual limita las
+     *  alarmas allow-while-idle a ~9 min, pero el chequeo de salud interno del
+     *  servicio cubre ese hueco sin depender de la alarma. */
+    private static final long INTERVALO_MS = 3 * 60 * 1000L;
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -51,24 +53,48 @@ public class WatchdogReceiver extends BroadcastReceiver {
         if (Intent.ACTION_BOOT_COMPLETED.equals(accion)
                 || "android.intent.action.QUICKBOOT_POWERON".equals(accion)) {
             DiagnosticoLog.registrar(context, "🔄 Tablet reiniciada — levantando servidor");
-            arrancarServidorSiHaceFalta(context);
-            programarProximoTick(context);
+            try {
+                arrancarServidorSiHaceFalta(context);
+            } catch (Throwable t) {
+                Log.e(TAG, "Error al levantar el servidor tras el reinicio", t);
+            } finally {
+                programarProximoTick(context);
+            }
             return;
         }
 
         if (ACCION_TICK.equals(accion)) {
-            arrancarServidorSiHaceFalta(context);
-            programarProximoTick(context); // se reprograma a sí mismo — cadena infinita mientras la app exista
+            try {
+                arrancarServidorSiHaceFalta(context);
+            } catch (Throwable t) {
+                // Si algo falla (p. ej. ForegroundServiceStartNotAllowed),
+                // igual hay que reprogramar: si no, esta cadena de
+                // auto-recuperación muere para siempre.
+                Log.e(TAG, "Error en el tick del watchdog", t);
+            } finally {
+                programarProximoTick(context);
+            }
         }
     }
 
     private void arrancarServidorSiHaceFalta(Context context) {
-        if (ServidorService.getInstancia() != null) {
-            // Seguía vivo — se deja constancia igual, así en el registro se
-            // ve una línea cada 10 min confirmando que no hubo cortes, en
-            // vez de solo silencio (que podría ser "todo bien" o "la app
-            // ni se está ejecutando", indistinguibles a simple vista).
-            DiagnosticoLog.registrar(context, "✓ watchdog: servidor sigue activo");
+        ServidorService servicio = ServidorService.getInstancia();
+        if (servicio != null) {
+            // ★ FIX — antes solo se comprobaba que la instancia existiera.
+            // El caso más grave era justo el contrario: servicio "vivo" pero
+            // con los puertos sin abrir, mostrando el servidor como encendido
+            // mientras ningún cliente podía conectarse.
+            if (!servicio.estaSaludable()) {
+                Log.w(TAG, "⚠️ ServidorService vivo pero sin puertos operativos — reparando");
+                DiagnosticoLog.registrar(context, "⚠️ watchdog: servidor sin puertos — reparando");
+                servicio.reintentarServidores();
+            } else {
+                // Se deja constancia igual, así en el registro se ve una
+                // línea cada tick confirmando que no hubo cortes, en vez de
+                // solo silencio (que podría ser "todo bien" o "la app ni se
+                // está ejecutando", indistinguibles a simple vista).
+                DiagnosticoLog.registrar(context, "✓ watchdog: servidor sigue activo");
+            }
             return;
         }
         Log.w(TAG, "⚠️ ServidorService no está corriendo — reiniciando");
@@ -95,6 +121,21 @@ public class WatchdogReceiver extends BroadcastReceiver {
         ContextCompat.startForegroundService(context, serviceIntent);
     }
 
+    /** ★ NUEVO — corta la cadena de auto-recuperación. Se usa SOLO cuando el
+     *  usuario apaga el servidor a propósito desde la pantalla de estado; si
+     *  no, el watchdog lo volvería a levantar a los pocos minutos. */
+    public static void cancelarProximoTick(Context context) {
+        AlarmManager am = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        if (am == null) return;
+        Intent intent = new Intent(context, WatchdogReceiver.class);
+        intent.setAction(ACCION_TICK);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                | (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0);
+        PendingIntent pi = PendingIntent.getBroadcast(context, REQUEST_CODE, intent, flags);
+        am.cancel(pi);
+        pi.cancel();
+    }
+
     /** Se llama tanto desde acá (para encadenar el próximo tick) como desde
      *  ServidorService.onCreate() (para arrancar la cadena la primera vez). */
     @SuppressLint("ScheduleExactAlarm")
@@ -109,12 +150,27 @@ public class WatchdogReceiver extends BroadcastReceiver {
         PendingIntent pi = PendingIntent.getBroadcast(context, REQUEST_CODE, intent, flags);
 
         long cuando = SystemClock.elapsedRealtime() + INTERVALO_MS;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            // Dispara incluso en Doze profundo — es justo el caso que nos importa
-            // (tablet con pantalla apagada hace rato, sin nadie usándola).
-            am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, cuando, pi);
-        } else {
-            am.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, cuando, pi);
+        // ★ FIX ANDROID 14 — con targetSdk 34, setExactAndAllowWhileIdle()
+        // lanza SecurityException si el usuario no otorgó "Alarmas y
+        // recordatorios" a la app. El @SuppressLint solo silencia el lint,
+        // NO evita el crash en runtime; antes eso podía tumbar el receiver
+        // justo cuando más se lo necesitaba. Se degrada a una alarma
+        // inexacta (que igual se reprograma sola) en vez de abortar.
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !am.canScheduleExactAlarms()) {
+                am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, cuando, pi);
+            } else {
+                // Dispara incluso en Doze profundo — es justo el caso que nos
+                // importa (tablet con pantalla apagada hace rato).
+                am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, cuando, pi);
+            }
+        } catch (SecurityException e) {
+            Log.w(TAG, "Sin permiso de alarmas exactas; se usa alarma inexacta", e);
+            try {
+                am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, cuando, pi);
+            } catch (Throwable t) {
+                am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, cuando, pi);
+            }
         }
     }
 }
